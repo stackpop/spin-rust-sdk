@@ -12,7 +12,7 @@ wasmtime::component::bindgen!({
 use {
     anyhow::Result,
     http_body_util::BodyExt,
-    std::sync::OnceLock,
+    std::{sync::OnceLock, time::Duration},
     tokio::{fs, process::Command},
     wasmtime::{
         Config, Engine, Store,
@@ -82,6 +82,7 @@ fn store_and_linker() -> Result<(Store<Ctx>, Linker<Ctx>)> {
 
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
 
     Ok((
         Store::new(
@@ -96,41 +97,56 @@ fn store_and_linker() -> Result<(Store<Ctx>, Linker<Ctx>)> {
     ))
 }
 
-#[tokio::test]
-async fn simple_http() -> Result<()> {
+async fn http_response(uri: &str) -> Result<(hyperium::StatusCode, bytes::Bytes)> {
     let component = Component::new(engine(), build_component("simple-http").await?)?;
 
     let (mut store, linker) = store_and_linker()?;
 
-    let (request, fut) = wasmtime_wasi_http::p3::Request::from_http(
-        crate::http::Request::post("http://localhost:3000").body(crate::http::FullBody::new(
-            bytes::Bytes::copy_from_slice(b"test"),
-        ))?,
-    );
+    let (request, fut) =
+        wasmtime_wasi_http::p3::Request::from_http(crate::http::Request::post(uri).body(
+            crate::http::FullBody::new(bytes::Bytes::copy_from_slice(b"test")),
+        )?);
 
     let http_service = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
         &mut store, &component, &linker,
     )
     .await?;
 
-    let (status, resp_bytes) = store
-        .run_concurrent(async |accessor| {
-            let resp_fut = async {
-                let resp = http_service.handle(accessor, request).await??;
-                let resp = accessor.with(|access| resp.into_http(access, async { Ok(()) }))?;
-                let status = resp.status();
-                let body = resp.into_body().collect().await?.to_bytes();
-                anyhow::Ok((status, body))
-            };
-            let (status_body, ()) = tokio::try_join!(resp_fut, async {
-                fut.await.map_err(|e| anyhow::anyhow!("{e:?}"))
-            })?;
-            anyhow::Ok(status_body)
-        })
-        .await??;
+    let response = store.run_concurrent(async |accessor| {
+        let resp_fut = async {
+            let resp = http_service.handle(accessor, request).await??;
+            let resp = accessor.with(|access| resp.into_http(access, async { Ok(()) }))?;
+            let status = resp.status();
+            let body = resp.into_body().collect().await?.to_bytes();
+            anyhow::Ok((status, body))
+        };
+        let (status_body, ()) = tokio::try_join!(resp_fut, async {
+            fut.await.map_err(|e| anyhow::anyhow!("{e:?}"))
+        })?;
+        anyhow::Ok(status_body)
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .map_err(|_| anyhow::anyhow!("HTTP component did not finish within 5 seconds"))?;
+    result?
+}
+
+#[tokio::test]
+async fn simple_http() -> Result<()> {
+    let (status, resp_bytes) = http_response("http://localhost:3000").await?;
 
     assert!(status.is_success());
     assert_eq!(resp_bytes.as_ref(), b"Hello, world!");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawned_task_progresses_without_host_wakeup() -> Result<()> {
+    let (status, resp_bytes) = http_response("http://localhost:3000/spawn-progress").await?;
+
+    assert!(status.is_success());
+    assert_eq!(resp_bytes.as_ref(), b"spawned child completed");
 
     Ok(())
 }
