@@ -97,15 +97,16 @@ fn store_and_linker() -> Result<(Store<Ctx>, Linker<Ctx>)> {
     ))
 }
 
-async fn http_response(uri: &str) -> Result<(hyperium::StatusCode, bytes::Bytes)> {
-    let component = Component::new(engine(), build_component("simple-http").await?)?;
+async fn http_response(component_name: &str) -> Result<(hyperium::StatusCode, bytes::Bytes)> {
+    let component = Component::new(engine(), build_component(component_name).await?)?;
 
     let (mut store, linker) = store_and_linker()?;
 
-    let (request, fut) =
-        wasmtime_wasi_http::p3::Request::from_http(crate::http::Request::post(uri).body(
-            crate::http::FullBody::new(bytes::Bytes::copy_from_slice(b"test")),
-        )?);
+    let (request, fut) = wasmtime_wasi_http::p3::Request::from_http(
+        crate::http::Request::post("http://localhost:3000").body(crate::http::FullBody::new(
+            bytes::Bytes::copy_from_slice(b"test"),
+        ))?,
+    );
 
     let http_service = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
         &mut store, &component, &linker,
@@ -133,7 +134,7 @@ async fn http_response(uri: &str) -> Result<(hyperium::StatusCode, bytes::Bytes)
 
 #[tokio::test]
 async fn simple_http() -> Result<()> {
-    let (status, resp_bytes) = http_response("http://localhost:3000").await?;
+    let (status, resp_bytes) = http_response("simple-http").await?;
 
     assert!(status.is_success());
     assert_eq!(resp_bytes.as_ref(), b"Hello, world!");
@@ -143,12 +144,19 @@ async fn simple_http() -> Result<()> {
 
 #[tokio::test]
 async fn spawned_task_progresses_without_host_wakeup() -> Result<()> {
-    let (status, resp_bytes) = http_response("http://localhost:3000/spawn-progress").await?;
+    let (status, resp_bytes) = http_response("spawn-progress").await?;
 
     assert!(status.is_success());
     assert_eq!(resp_bytes.as_ref(), b"spawned child completed");
 
     Ok(())
+}
+
+#[test]
+#[allow(deprecated)]
+fn legacy_spawn_retains_unit_return_and_non_send_input() {
+    type LocalTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+    let _: fn(LocalTask) = crate::wasip3::spawn;
 }
 
 #[tokio::test]
